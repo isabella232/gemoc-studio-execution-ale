@@ -16,6 +16,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import org.eclipse.acceleo.query.runtime.EvaluationResult;
 import org.eclipse.acceleo.query.runtime.IQueryBuilderEngine;
@@ -29,8 +30,12 @@ import org.eclipse.emf.common.util.Diagnostic;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.EPackage;
 import org.eclipse.emf.ecore.resource.Resource;
+import org.eclipse.emf.ecore.resource.ResourceSet;
+import org.eclipse.emf.ecoretools.ale.core.env.IAleEnvironment;
+import org.eclipse.emf.ecoretools.ale.core.interpreter.IAleInterpreter;
 import org.eclipse.emf.ecoretools.ale.core.interpreter.impl.AleInterpreter;
 import org.eclipse.emf.ecoretools.ale.core.interpreter.impl.OptimizedEvaluationResult;
+import org.eclipse.emf.ecoretools.ale.core.interpreter.notapi.EvalEnvironment;
 import org.eclipse.gemoc.ale.interpreted.engine.AleEngine;
 import org.eclipse.sirius.common.acceleo.aql.business.internal.AQLSiriusInterpreter;
 import org.eclipse.sirius.common.tools.api.interpreter.EvaluationException;
@@ -62,12 +67,59 @@ public class ALESiriusInterpreter extends AQLSiriusInterpreter {
 	@Override
 	public IEvaluationResult evaluateExpression(final EObject target, final String fullExpression)
 			throws EvaluationException {
+
+		// select AleInterpreter or create a new one for edition mode (makes sure to
+		// dispose it when not used anymore)
+		Optional<AleInterpreter> aleInterpreter = findInterpreterForModel(target);
+		if (aleInterpreter.isPresent() && aleInterpreter.get().getQueryEnvironment() != null) {
+			return evaluateExpressionWithInterpreter(target, fullExpression, aleInterpreter.get());
+		} else {
+			
+			if(editionAleInterpreterCache != null && editionAleInterpreterCache.resSet != target.eResource().getResourceSet()) {
+				// new model, dispose previous one
+				editionAleInterpreterCache.env.close();
+				editionAleInterpreterCache.aleInterpreter.close();
+				editionAleInterpreterCache = null;
+			}
+			if(editionAleInterpreterCache ==  null) {
+				List<EPackage> metamodels = getMetamodels(target);
+				List<String> metmodelsPathes = metamodels.stream()
+						//.map(ePack -> new Path(ePack.eResource().getURI().toPlatformString(true)).toString())
+						.map(ePack -> ePack.eResource().getURI().toString())
+						.collect(Collectors.toList());
+				IAleEnvironment env = IAleEnvironment.fromPaths(metmodelsPathes, new ArrayList<String>());
+				IAleInterpreter interpreter = env.getInterpreter();
+				new EvalEnvironment(env, null, null);
+				editionAleInterpreterCache =  new EditionAleInterpreter(target.eResource().getResourceSet(), env, interpreter);
+			}
+			IEvaluationResult res = evaluateExpressionWithInterpreter(target, fullExpression, editionAleInterpreterCache.aleInterpreter);
+			return res;
+		}
+
+	}
+	
+	EditionAleInterpreter editionAleInterpreterCache;
+	
+	private class EditionAleInterpreter {
+		public ResourceSet resSet;
+		IAleEnvironment env;
+		public IAleInterpreter aleInterpreter;
+		public EditionAleInterpreter(ResourceSet resSet, IAleEnvironment env, IAleInterpreter aleInterpreter) {
+			this.resSet = resSet;
+			this.env = env;
+			this.aleInterpreter = aleInterpreter;
+			
+		}
+	}
+
+	public IEvaluationResult evaluateExpressionWithInterpreter(final EObject target, final String fullExpression,
+			IAleInterpreter aleInterpreter) throws EvaluationException {
 		this.javaExtensions.reloadIfNeeded();
 		String expression = fullExpression.replaceFirst("ale:", "");
 		Map<String, Object> variables = getVariables();
 		variables.put("self", target); //$NON-NLS-1$
 
-		IQueryEnvironment queryEnv = getQueryEnvironment(target);
+		IQueryEnvironment queryEnv = ((AleInterpreter) aleInterpreter).getQueryEnvironment();
 		final IQueryBuilderEngine builder = QueryParsing.newBuilder(queryEnv);
 		AstResult build = builder.build(expression);
 		IQueryEvaluationEngine evaluationEngine = QueryEvaluation.newEngine(queryEnv);
@@ -80,33 +132,10 @@ public class ALESiriusInterpreter extends AQLSiriusInterpreter {
 		if (Diagnostic.OK != evalResult.getDiagnostic().getSeverity()) {
 			diagnostic.merge(evalResult.getDiagnostic());
 		}
-		if (queryEnv instanceof BasicEditionRawAleEnvironment) {
-			// release resources
-			((BasicEditionRawAleEnvironment) queryEnv).close();
-		}
 		return new OptimizedEvaluationResult(Optional.ofNullable(evalResult.getResult()), diagnostic);
 	}
 
-	/**
-	 * retrieve the queryEnvironment from the associated engine or create a
-	 * BasicEditionRawAleEnvironment (for edition mode) Important:
-	 * BasicEditionRawAleEnvironment must be closed after use, in order to avoid
-	 * memory leak
-	 */
-	@SuppressWarnings("resource")
-	private IQueryEnvironment getQueryEnvironment(final EObject target) {
-		Optional<AleInterpreter> aleInterpreter = findInterpreterForModel(target);
-		if (aleInterpreter.isPresent() && aleInterpreter.get().getQueryEnvironment() != null) {
-			return aleInterpreter.get().getQueryEnvironment();
-		} else {
-			List<EPackage> metamodels = getMetamodels(target);
-			IQueryEnvironment queryEnv = new BasicEditionRawAleEnvironment(metamodels).getContext();
-			for (EPackage pack : metamodels) {
-				queryEnv.registerEPackage(pack);
-			}
-			return queryEnv;
-		}
-	}
+
 
 	/**
 	 * Look in known engines that are running the model containing the given target
